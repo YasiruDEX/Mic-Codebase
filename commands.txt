@@ -1,0 +1,58 @@
+# ==========================================
+# Classroom Whisper Monitor — Run Commands
+# ==========================================
+
+# ---------------------------------------------------------
+# TERMINAL 1: Start the Storage Server (can be on another machine)
+# ---------------------------------------------------------
+cd ~/Documents/GitHub/Mic\ Codebase
+source .venv/bin/activate
+pip install -r storage_server/requirements.txt
+python storage_server/run.py
+
+# ---------------------------------------------------------
+# TERMINAL 2: Start the Mic Backend (sends audio to storage server)
+# ---------------------------------------------------------
+cd ~/Documents/GitHub/Mic\ Codebase
+source .venv/bin/activate
+pip install -r backend/requirements.txt
+python backend/run.py
+
+# NOTE: By default the mic backend connects to http://localhost:5050
+# If the storage server is on another machine, set the env var:
+#   export STORAGE_SERVER_URL=http://192.168.1.100:5050
+#   python backend/run.py
+
+# ---------------------------------------------------------
+# TERMINAL 3 (optional): Start the Frontend
+# ---------------------------------------------------------
+cd ~/Documents/GitHub/Mic\ Codebase/frontend
+npm run dev
+
+# ---------------------------------------------------------
+# DECOMPRESSION (run on the storage server machine)
+# ---------------------------------------------------------
+cd ~/Documents/GitHub/Mic\ Codebase
+source .venv/bin/activate
+
+# Decompress a single file:
+python backend/audio_decompressor.py storage_server/audio_storage/your_file.opus
+
+# Batch decompress all files:
+python backend/audio_decompressor.py --all storage_server/audio_storage/
+
+# Batch decompress into a separate folder:
+python backend/audio_decompressor.py --all storage_server/audio_storage/ --output-dir decompressed/
+
+# ---------------------------------------------------------
+# API QUICK TEST (verify storage server is running)
+# ---------------------------------------------------------
+curl http://localhost:5050/health
+curl http://localhost:5050/files
+
+# ---------------------------------------------------------
+# RUN TESTS
+# ---------------------------------------------------------
+cd ~/Documents/GitHub/Mic\ Codebase
+source .venv/bin/activate
+python -m pytest backend/tests/ -v

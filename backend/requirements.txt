@@ -1,0 +1,8 @@
+torch
+torchaudio
+sounddevice
+numpy
+firebase-admin
+python-dotenv
+pyusb
+requests
