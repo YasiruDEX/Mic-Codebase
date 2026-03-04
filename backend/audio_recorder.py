@@ -43,17 +43,21 @@ class AudioRecorder:
 
     def __init__(self, storage_server_url: str = None,
                  segment_seconds: int = None,
-                 sample_rate: int = DEFAULT_SAMPLE_RATE):
+                 sample_rate: int = DEFAULT_SAMPLE_RATE,
+                 metadata_provider=None):
         """
         Args:
             storage_server_url: URL of the storage server (e.g. http://192.168.1.100:5050).
             segment_seconds: Duration of each audio segment in seconds.
             sample_rate: Audio sample rate (must match VocalFilter).
+            metadata_provider: Optional callback returning dict metadata to attach
+                              to each segment before upload.
         """
         self.sample_rate = sample_rate
         self.segment_seconds = segment_seconds or DEFAULT_SEGMENT_SECONDS
         self.samples_per_segment = self.sample_rate * self.segment_seconds
         self.storage_server_url = storage_server_url or DEFAULT_STORAGE_SERVER_URL
+        self.metadata_provider = metadata_provider
 
         # Local fallback directory (if server unreachable)
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -231,6 +235,14 @@ class AudioRecorder:
                 "original_filename": os.path.basename(actual_path),
                 "file_size_bytes": os.path.getsize(actual_path)
             }
+
+            if self.metadata_provider:
+                try:
+                    dynamic_metadata = self.metadata_provider()
+                    if isinstance(dynamic_metadata, dict):
+                        metadata.update(dynamic_metadata)
+                except Exception as e:
+                    logger.warning(f"⚠️  Metadata provider failed: {e}")
 
             # Try uploading to server
             uploaded = self._upload_to_server(actual_path, metadata)

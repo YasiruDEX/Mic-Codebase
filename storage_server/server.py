@@ -14,20 +14,28 @@ Endpoints:
 """
 
 import os
-import sys
 import json
 import shutil
 import subprocess
 import logging
+import time
 from datetime import datetime
 
 from flask import Flask, request, jsonify, send_file, send_from_directory
+from dotenv import load_dotenv
+
+from vad_processor import SegmentVADProcessor
+from firebase_publisher import FirebasePublisher
 
 # ─── Configuration ────────────────────────────────────────────────────────────
+
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 
 STORAGE_PORT = int(os.getenv("STORAGE_PORT", "5050"))
 STORAGE_DIR = os.getenv("STORAGE_DIR", os.path.join(os.path.dirname(__file__), "audio_storage"))
 DECOMPRESS_DIR = os.path.join(STORAGE_DIR, "decompressed")
+VAD_THRESHOLD = float(os.getenv("VOICE_THRESHOLD", "0.5"))
+VAD_SAMPLE_RATE = int(os.getenv("VAD_SAMPLE_RATE", "16000"))
 
 # ─── Setup ────────────────────────────────────────────────────────────────────
 
@@ -43,6 +51,26 @@ os.makedirs(DECOMPRESS_DIR, exist_ok=True)
 # Check ffmpeg
 FFMPEG_AVAILABLE = shutil.which("ffmpeg") is not None
 
+_vad_processor = None
+_firebase_publisher = None
+
+
+def get_vad_processor():
+    global _vad_processor
+    if _vad_processor is None:
+        _vad_processor = SegmentVADProcessor(
+            threshold=VAD_THRESHOLD,
+            sample_rate=VAD_SAMPLE_RATE
+        )
+    return _vad_processor
+
+
+def get_firebase_publisher():
+    global _firebase_publisher
+    if _firebase_publisher is None:
+        _firebase_publisher = FirebasePublisher()
+    return _firebase_publisher
+
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 
@@ -57,6 +85,8 @@ def health():
         "storage_dir": STORAGE_DIR,
         "file_count": file_count,
         "ffmpeg_available": FFMPEG_AVAILABLE,
+        "server_vad": "enabled",
+        "firebase_configured": bool(os.getenv("FIREBASE_DATABASE_URL")),
         "timestamp": datetime.now().isoformat()
     })
 
@@ -111,17 +141,51 @@ def upload():
         "source_ip": request.remote_addr
     })
 
+    vad_result = {
+        "voice_probability": 0.0,
+        "is_voice": False,
+        "chunks": 0,
+        "speech_ratio": 0.0
+    }
+    firebase_published = False
+
+    try:
+        vad_processor = get_vad_processor()
+        metadata_sample_rate = int(metadata.get("sample_rate", VAD_SAMPLE_RATE))
+        vad_result = vad_processor.analyze_file(filepath, sample_rate=metadata_sample_rate)
+
+        # Firebase payload: only VAD fields (DOA comes from backend in real-time)
+        firebase_payload = {
+            "is_voice": bool(vad_result["is_voice"]),
+            "voice_probability": round(float(vad_result["voice_probability"]), 4),
+            "vad_timestamp": int(time.time() * 1000)
+        }
+
+        publisher = get_firebase_publisher()
+        firebase_published = publisher.publish(firebase_payload)
+    except Exception as e:
+        logger.error(f"❌ Server-side VAD/Firebase processing failed: {e}")
+
+    metadata["vad"] = vad_result
+    metadata["firebase_published"] = firebase_published
+
     json_path = os.path.splitext(filepath)[0] + ".json"
     with open(json_path, 'w') as f:
         json.dump(metadata, f, indent=2)
 
-    logger.info(f"📥 Received: {filename} ({file_size:,}B) from {request.remote_addr}")
+    logger.info(
+        f"📥 Received: {filename} ({file_size:,}B) from {request.remote_addr} | "
+        f"VAD={vad_result['voice_probability']:.3f} voice={vad_result['is_voice']} | "
+        f"Firebase={'✅' if firebase_published else '⚠️'}"
+    )
 
     return jsonify({
         "status": "ok",
         "filename": filename,
         "size_bytes": file_size,
-        "metadata_saved": True
+        "metadata_saved": True,
+        "vad": vad_result,
+        "firebase_published": firebase_published
     }), 201
 
 
@@ -253,10 +317,11 @@ if __name__ == '__main__':
 
     print("=" * 60)
     print("  📦 Audio Storage Server")
+    print("  🧠 Server-side VAD + Firebase Publisher")
     print(f"  🌐 Listening on 0.0.0.0:{STORAGE_PORT}")
     print(f"  💾 Storage: {STORAGE_DIR}")
     print(f"  🔧 ffmpeg: {'✅ available' if FFMPEG_AVAILABLE else '❌ not found'}")
     print("=" * 60)
     print()
 
-    app.run(host='0.0.0.0', port=STORAGE_PORT, debug=False)
+    app.run(host='0.0.0.0', port=STORAGE_PORT, debug=False, use_reloader=False)

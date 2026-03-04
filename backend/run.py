@@ -2,7 +2,7 @@
 """
 Classroom Whisper Monitor - Backend Entry Point
 ================================================
-Starts the Firebase tracker with deep learning vocal filter.
+Starts the mic audio uploader tracker.
 Run this with: python run.py
 """
 
@@ -43,7 +43,7 @@ def main():
     logger = logging.getLogger(__name__)
     logger.info("=" * 60)
     logger.info("  🎓 Classroom Whisper Monitor - Backend")
-    logger.info("  🧠 Deep Learning Vocal Filter (Silero VAD)")
+    logger.info("  🎤 Audio Uploader (Server-side VAD + Firebase)")
     logger.info("=" * 60)
     logger.info("")
 

@@ -1,26 +1,21 @@
 """
-ReSpeaker Mic Array - Firebase Realtime Tracker (with Deep Learning Vocal Filter)
-=================================================================================
-- Connects to Firebase Realtime Database
-- Runs Silero VAD deep learning model for voice activity detection
-- Reads DOA from the Mic Array hardware
-- Pushes live updates (including DL voice probability) to Firebase
-- Verbose logging to terminal
+ReSpeaker Mic Array - Audio Uploader Tracker
+============================================
+- Captures live mic audio from the system input device
+- Reads DOA from the ReSpeaker Mic Array hardware (if connected)
+- Uploads compressed audio segments to the storage server
+- Publishes real-time DOA + hardware metadata to Firebase
+- Embeds hardware metadata in uploads for server-side VAD processing
 """
 import sys
 import os
 import time
 import logging
-from datetime import datetime
 from dotenv import load_dotenv
+import sounddevice as sd
 
-# Firebase Admin SDK
 import firebase_admin
-from firebase_admin import credentials
-from firebase_admin import db
-
-# Deep Learning Vocal Filter
-from vocal_filter import VocalFilter
+from firebase_admin import credentials, db
 
 # Audio Recorder
 from audio_recorder import AudioRecorder
@@ -34,48 +29,46 @@ load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 # Add Mic Array script to path (from parent dir)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'usb_4_mic_array'))
 
-# Project root directory (parent of backend/)
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+# Audio stream configuration
+SAMPLE_RATE = 16000
+CHUNK_SAMPLES = 512
+CHANNELS = 1
 
-# Firebase Configuration - resolve relative paths against project root
-_firebase_creds = os.getenv("FIREBASE_CREDENTIALS", "firebase-adminsdk.json")
-if not os.path.isabs(_firebase_creds):
-    FIREBASE_CREDENTIALS_PATH = os.path.join(PROJECT_ROOT, _firebase_creds)
-else:
-    FIREBASE_CREDENTIALS_PATH = _firebase_creds
-FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL")
-
-# Vocal filter confidence threshold
-VOICE_THRESHOLD = float(os.getenv("VOICE_THRESHOLD", "0.5"))
-
-# Update interval in seconds
-UPDATE_INTERVAL = float(os.getenv("UPDATE_INTERVAL", "0.1"))
+# Status update interval in seconds
+STATUS_INTERVAL = float(os.getenv("STATUS_INTERVAL", "0.5"))
 
 # Audio recording configuration
 STORAGE_SERVER_URL = os.getenv("STORAGE_SERVER_URL", "http://localhost:5050")
-AUDIO_SEGMENT_SECONDS = int(os.getenv("AUDIO_SEGMENT_SECONDS", "30"))
+AUDIO_SEGMENT_SECONDS = int(os.getenv("AUDIO_SEGMENT_SECONDS", "1"))
+
+# Firebase configuration
+FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL")
+FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS", "firebase-adminsdk.json")
 
 
 def initialize_firebase():
-    """Initialize Firebase Admin SDK"""
+    """Initialize Firebase Admin SDK for publishing DOA."""
+    if not FIREBASE_DATABASE_URL:
+        logger.warning("⚠️  FIREBASE_DATABASE_URL not set. Real-time DOA updates disabled.")
+        return None
+
     try:
-        logger.info(f"🔥 Initializing Firebase...")
-        logger.info(f"   Credentials: {FIREBASE_CREDENTIALS_PATH}")
-        logger.info(f"   Database URL: {FIREBASE_DATABASE_URL}")
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+        creds_path = FIREBASE_CREDENTIALS
+        if not os.path.isabs(creds_path):
+            creds_path = os.path.join(project_root, creds_path)
 
-        if not FIREBASE_DATABASE_URL:
-            logger.error("❌ FIREBASE_DATABASE_URL not found in .env")
-            sys.exit(1)
+        if not firebase_admin._apps:
+            cred = credentials.Certificate(creds_path)
+            firebase_admin.initialize_app(cred, {
+                'databaseURL': FIREBASE_DATABASE_URL
+            })
 
-        cred = credentials.Certificate(FIREBASE_CREDENTIALS_PATH)
-        firebase_admin.initialize_app(cred, {
-            'databaseURL': FIREBASE_DATABASE_URL
-        })
-        logger.info("✅ Firebase initialized successfully.")
+        logger.info("✅ Firebase initialized for real-time DOA publishing.")
+        return db.reference('mic_data')
     except Exception as e:
-        logger.error(f"❌ Failed to initialize Firebase: {e}")
-        sys.exit(1)
-
+        logger.error(f"❌ Firebase init failed: {e}")
+        return None
 
 def initialize_mic():
     """Find and initialize the ReSpeaker Mic Array (optional - graceful fallback)"""
@@ -87,7 +80,7 @@ def initialize_mic():
         dev = usb.core.find(idVendor=0x2886, idProduct=0x0018)
         if not dev:
             logger.warning("⚠️  ReSpeaker Mic Array not found. Hardware DOA/VAD disabled.")
-            logger.warning("   Deep learning vocal filter will still work with system mic.")
+            logger.warning("   Audio capture and upload will continue with system mic.")
             return None
 
         logger.info("✅ ReSpeaker Mic Array found!")
@@ -103,107 +96,117 @@ def initialize_mic():
 
 
 def run_tracker():
-    """Main tracking loop with deep learning vocal filter."""
+    """Main tracking loop for audio upload + real-time DOA publishing to Firebase."""
 
     logger.info("=" * 60)
     logger.info("  Classroom Whisper Monitor - Backend")
-    logger.info("  Deep Learning Vocal Filter (Silero VAD)")
+    logger.info("  Audio Uploader + Real-time DOA Publisher")
     logger.info("=" * 60)
 
-    # Step 1: Initialize Firebase
-    initialize_firebase()
+    # Step 1: Initialize Firebase for DOA publishing
+    mic_data_ref = initialize_firebase()
 
     # Step 2: Initialize hardware mic array (optional)
     mic = initialize_mic()
 
-    # Step 3: Initialize deep learning vocal filter
-    logger.info("")
-    logger.info("🧠 Initializing Deep Learning Vocal Filter...")
-    vocal_filter = VocalFilter(threshold=VOICE_THRESHOLD)
+    latest_hw_state = {
+        "doa": 0,
+        "is_voice_hw": False
+    }
 
-    # Step 4: Initialize audio recorder
+    def metadata_provider():
+        return {
+            "doa": latest_hw_state["doa"],
+            "is_voice_hw": latest_hw_state["is_voice_hw"]
+        }
+
+    # Step 3: Initialize audio recorder/uploader
     logger.info("")
     logger.info("🔴 Initializing Audio Recorder...")
     audio_recorder = AudioRecorder(
         storage_server_url=STORAGE_SERVER_URL,
-        segment_seconds=AUDIO_SEGMENT_SECONDS
+        segment_seconds=AUDIO_SEGMENT_SECONDS,
+        sample_rate=SAMPLE_RATE,
+        metadata_provider=metadata_provider
     )
-    vocal_filter.add_audio_observer(audio_recorder.on_audio_chunk)
     audio_recorder.start()
 
-    # Start vocal filter AFTER registering observers
-    vocal_filter.start()
+    # Step 4: Start audio input stream
+    logger.info("🎤 Starting microphone stream...")
+    stream = None
 
-    # Firebase reference
-    mic_data_ref = db.reference('mic_data')
+    stream = sd.InputStream(
+        samplerate=SAMPLE_RATE,
+        channels=CHANNELS,
+        blocksize=CHUNK_SAMPLES,
+        dtype='float32',
+        callback=lambda indata, frames, time_info, status: audio_recorder.on_audio_chunk(indata[:, 0])
+    )
+    stream.start()
 
     logger.info("")
-    logger.info("🚀 Real-time Firebase sync started!")
-    logger.info(f"   Update interval: {UPDATE_INTERVAL}s")
-    logger.info(f"   Voice threshold: {VOICE_THRESHOLD}")
-    logger.info(f"   Audio segments: {AUDIO_SEGMENT_SECONDS}s")
+    logger.info("🚀 Audio upload tracker + real-time DOA publisher started!")
+    logger.info(f"   Status interval: {STATUS_INTERVAL}s")
+    logger.info(f"   Chunk duration: {AUDIO_SEGMENT_SECONDS}s (real-time VAD)")
+    logger.info(f"   Storage server: {STORAGE_SERVER_URL}")
+    if mic_data_ref:
+        logger.info(f"   Firebase DOA updates: ✅ enabled")
     logger.info("   Press Ctrl+C to stop.")
     logger.info("-" * 60)
 
-    update_count = 0
+    status_count = 0
 
     try:
         while True:
             # Read hardware DOA and VAD (if mic array is connected)
             if mic:
                 try:
-                    current_doa = mic.direction
-                    hardware_vad = bool(mic.is_voice())
+                    latest_hw_state["doa"] = mic.direction
+                    latest_hw_state["is_voice_hw"] = bool(mic.is_voice())
                 except Exception:
-                    current_doa = 0
-                    hardware_vad = False
+                    latest_hw_state["doa"] = 0
+                    latest_hw_state["is_voice_hw"] = False
             else:
-                current_doa = 0
-                hardware_vad = False
+                latest_hw_state["doa"] = 0
+                latest_hw_state["is_voice_hw"] = False
 
-            # Read deep learning voice probability
-            dl_probability = vocal_filter.voice_probability
-            dl_is_voice = vocal_filter.is_voice
-
-            # Build payload
-            timestamp = int(time.time() * 1000)
-            payload = {
-                'doa': current_doa,
-                'is_voice': dl_is_voice,           # DL-based detection (primary)
-                'is_voice_hw': hardware_vad,        # Hardware VAD (secondary)
-                'voice_probability': round(dl_probability, 4),
-                'timestamp': timestamp
-            }
-
-            # Push to Firebase
-            mic_data_ref.set(payload)
+            # Publish real-time DOA + hardware VAD to Firebase
+            if mic_data_ref:
+                try:
+                    payload = {
+                        "doa": latest_hw_state["doa"],
+                        "is_voice_hw": latest_hw_state["is_voice_hw"],
+                        "timestamp": int(time.time() * 1000)
+                    }
+                    mic_data_ref.update(payload)
+                except Exception as e:
+                    logger.error(f"❌ Firebase DOA publish failed: {e}")
 
             # Terminal logging
-            update_count += 1
-            now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-
-            # Build status bar
-            prob_bar = "█" * int(dl_probability * 20) + "░" * (20 - int(dl_probability * 20))
-            dl_status = "🗣️  VOICE" if dl_is_voice else "🔇 silent"
-            hw_status = "HW:🗣️ " if hardware_vad else "HW:🔇"
+            status_count += 1
+            recorder_status = audio_recorder.get_status()
+            hw_status = "HW:🗣️ " if latest_hw_state["is_voice_hw"] else "HW:🔇"
 
             logger.info(
-                f"[{now}] #{update_count:06d} | "
-                f"DOA: {current_doa:03d}° | "
-                f"DL: [{prob_bar}] {dl_probability:.3f} {dl_status} | "
-                f"{hw_status}"
+                f"#{status_count:06d} | "
+                f"DOA: {latest_hw_state['doa']:03d}° | "
+                f"{hw_status} | "
+                f"Uploaded: {recorder_status['uploaded']} | "
+                f"Buffered: {recorder_status['buffer_seconds']:.2f}s"
             )
 
-            time.sleep(UPDATE_INTERVAL)
+            time.sleep(STATUS_INTERVAL)
 
     except KeyboardInterrupt:
         logger.info("")
         logger.info("🛑 Stopping tracker...")
 
     finally:
-        vocal_filter.stop()
+        if stream is not None:
+            stream.stop()
+            stream.close()
         audio_recorder.stop()
-        logger.info(f"📊 Total updates sent: {update_count}")
+        logger.info(f"📊 Total status loops: {status_count}")
         logger.info("👋 Backend shut down cleanly.")
 
 

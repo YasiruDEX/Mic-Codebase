@@ -2,7 +2,8 @@
 """
 Audio Storage Server — Entry Point
 ====================================
-Starts the Flask API server for receiving and storing compressed audio.
+Starts the Flask API server for receiving audio, running server-side VAD,
+and publishing mic state to Firebase.
 
 Run with: python run.py
 """

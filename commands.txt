@@ -8,14 +8,20 @@
 cd ~/Documents/GitHub/Mic\ Codebase
 source .venv/bin/activate
 pip install -r storage_server/requirements.txt
+# Storage server now runs real-time VAD + Firebase publishing
+# export FIREBASE_DATABASE_URL=https://<your-project>.firebaseio.com
+# export FIREBASE_CREDENTIALS=firebase-adminsdk.json
 python storage_server/run.py
 
 # ---------------------------------------------------------
-# TERMINAL 2: Start the Mic Backend (sends audio to storage server)
+# TERMINAL 2: Start the Mic Backend (captures mic audio + uploads 1-sec chunks)
 # ---------------------------------------------------------
 cd ~/Documents/GitHub/Mic\ Codebase
 source .venv/bin/activate
 pip install -r backend/requirements.txt
+# Backend publishes real-time DOA to Firebase
+# export AUDIO_SEGMENT_SECONDS=1 (default, for real-time VAD)
+# export STORAGE_SERVER_URL=http://192.168.1.100:5050 (if on another machine)
 python backend/run.py
 
 # NOTE: By default the mic backend connects to http://localhost:5050
